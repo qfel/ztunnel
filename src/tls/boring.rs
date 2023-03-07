@@ -32,7 +32,9 @@ use boring::x509::extension::{
     AuthorityKeyIdentifier, BasicConstraints, ExtendedKeyUsage, KeyUsage, SubjectAlternativeName,
 };
 use boring::x509::verify::X509CheckFlags;
-use boring::x509::{self, X509StoreContext, X509StoreContextRef, X509VerifyResult};
+use boring::x509::{
+    X509NameBuilder, X509ReqBuilder, X509StoreContext, X509StoreContextRef, X509VerifyResult, X509,
+};
 use hyper::client::ResponseFuture;
 use hyper::server::conn::AddrStream;
 use hyper::{Request, Uri};
@@ -52,24 +54,35 @@ pub fn asn1_time_to_system_time(time: &Asn1TimeRef) -> SystemTime {
         + Duration::from_secs(unix_time.days as u64 * 86400 + unix_time.secs as u64)
 }
 
-fn system_time_to_asn1_time(time: SystemTime) -> Option<Asn1Time> {
-    let ts = time.duration_since(UNIX_EPOCH).ok()?.as_secs();
-    Asn1Time::from_unix(ts.try_into().ok()?).ok()
+enum Round {
+    Up,
+    Down,
+}
+
+fn system_time_to_asn1_time(time: SystemTime, dir: Round) -> Option<Asn1Time> {
+    let mut dur = time.duration_since(UNIX_EPOCH).ok()?;
+    if let Round::Up = dir {
+        dur += Duration::from_secs(1) - Duration::from_nanos(1);
+    }
+    Asn1Time::from_unix(dur.as_secs().try_into().ok()?).ok()
+}
+
+fn not_after(x509: &X509) -> SystemTime {
+    asn1_time_to_system_time(x509.not_after())
+}
+
+fn not_before(x509: &X509) -> SystemTime {
+    asn1_time_to_system_time(x509.not_before())
 }
 
 pub fn cert_from(key: &[u8], cert: &[u8], chain: Vec<&[u8]>) -> Certs {
     let key = pkey::PKey::private_key_from_pem(key).unwrap();
-    let cert = x509::X509::from_pem(cert).unwrap();
-    let ztunnel_cert = ZtunnelCert::new(cert);
+    let cert = X509::from_pem(cert).unwrap();
     let chain = chain
         .into_iter()
-        .map(|pem| ZtunnelCert::new(x509::X509::from_pem(pem).unwrap()))
+        .map(|pem| X509::from_pem(pem).unwrap())
         .collect();
-    Certs {
-        cert: ztunnel_cert,
-        chain,
-        key,
-    }
+    Certs { cert, chain, key }
 }
 
 pub struct CertSign {
@@ -87,7 +100,7 @@ impl CsrOptions {
         let ec_key = EcKey::generate(&group)?;
         let pkey = PKey::from_ec_key(ec_key)?;
 
-        let mut csr = x509::X509ReqBuilder::new()?;
+        let mut csr = X509ReqBuilder::new()?;
         csr.set_pubkey(&pkey)?;
         let mut extensions = Stack::new()?;
         let subject_alternative_name = SubjectAlternativeName::new()
@@ -110,83 +123,60 @@ impl CsrOptions {
 }
 
 #[derive(Clone, Debug)]
-pub struct ZtunnelCert {
-    x509: x509::X509,
-    not_before: SystemTime,
-    not_after: SystemTime,
-}
-
-// Wrapper around X509 that uses SystemTime for not_before/not_after.
-// Asn1Time does not support sub-second granularity.
-impl ZtunnelCert {
-    pub fn new(cert: x509::X509) -> ZtunnelCert {
-        ZtunnelCert {
-            not_before: asn1_time_to_system_time(cert.not_before()),
-            not_after: asn1_time_to_system_time(cert.not_after()),
-            x509: cert, // cert is already owned, the asn1_ functions borrow cert so as long as we move cert to ZtunnelCert after the borrows this doesn't need cloning
-        }
-    }
-}
-
-#[derive(Clone, Debug)]
 pub struct Certs {
     // the leaf cert
-    cert: ZtunnelCert,
+    cert: X509,
     // the remainder of the chain, not including the leaf cert
-    chain: Vec<ZtunnelCert>,
+    chain: Vec<X509>,
     key: pkey::PKey<pkey::Private>,
 }
 
 impl PartialEq for Certs {
     fn eq(&self, other: &Self) -> bool {
-        self.cert
-            .x509
-            .to_der()
-            .iter()
-            .eq(other.cert.x509.to_der().iter())
+        self.cert.to_der().iter().eq(other.cert.to_der().iter())
             && self
                 .key
                 .private_key_to_der()
                 .iter()
                 .eq(other.key.private_key_to_der().iter())
-            && self.cert.not_after == other.cert.not_after
-            && self.cert.not_before == other.cert.not_before
+            && not_after(&self.cert) == not_after(&other.cert)
+            && not_before(&self.cert) == not_before(&other.cert)
     }
 }
 
 impl Certs {
     pub fn chain(&self) -> Result<bytes::Bytes, Error> {
-        Ok(self.chain[0].x509.to_pem()?.into())
+        Ok(self.chain[0].to_pem()?.into())
     }
-    pub fn is_expired(&self) -> bool {
-        SystemTime::now() > self.cert.not_after
+
+    #[cfg(test)]
+    pub(in crate::tls::boring) fn is_expired(&self) -> bool {
+        SystemTime::now() > not_after(&self.cert)
     }
 
     pub fn refresh_at(&self) -> SystemTime {
-        match self.cert.not_after.duration_since(self.cert.not_before) {
-            Ok(valid_for) => self.cert.not_before + valid_for / 2,
-            Err(_) => self.cert.not_after,
+        match not_after(&self.cert).duration_since(not_before(&self.cert)) {
+            Ok(valid_for) => not_before(&self.cert) + valid_for / 2,
+            Err(_) => not_after(&self.cert),
         }
     }
 
     pub fn get_duration_until_refresh(&self) -> Duration {
-        let halflife = self
-            .cert
-            .not_after
-            .duration_since(self.cert.not_before)
+        let halflife = not_after(&self.cert)
+            .duration_since(not_before(&self.cert))
             .unwrap_or_else(|_| std::time::Duration::from_secs(0))
             / 2;
         // If now() is earlier than not_before, we need to refresh ASAP, so return 0.
         let elapsed = SystemTime::now()
-            .duration_since(self.cert.not_before)
+            .duration_since(not_before(&self.cert))
             .unwrap_or(halflife);
         halflife
             .checked_sub(elapsed)
             .unwrap_or_else(|| Duration::from_secs(0))
     }
 
-    pub fn x509(&self) -> &x509::X509 {
-        &self.cert.x509
+    pub fn x509(&self) -> &X509 {
+        &self.cert
     }
 }
 
@@ -212,7 +202,7 @@ pub fn grpc_connector(uri: String, root_cert: RootCert) -> Result<TlsGrpcChannel
         }
         RootCert::Static(b) => {
             conn.cert_store_mut()
-                .add_cert(x509::X509::from_pem(&b).map_err(Error::InvalidRootCert)?)
+                .add_cert(X509::from_pem(&b).map_err(Error::InvalidRootCert)?)
                 .map_err(Error::InvalidRootCert)?;
         }
         RootCert::Default => {} // Already configured to use system root certs
@@ -289,15 +279,15 @@ impl Certs {
 
         // key and certs
         conn.set_private_key(&self.key)?;
-        conn.set_certificate(&self.cert.x509)?;
+        conn.set_certificate(&self.cert)?;
         for (i, chain_cert) in self.chain.iter().enumerate() {
             // Only include intermediate certs in the chain.
             // The last cert is the root cert which should already exist on the peer.
             if i < (self.chain.len() - 1) {
                 // This is an intermediate cert that should be added to the cert chain
-                conn.add_extra_chain_cert(chain_cert.x509.clone())?;
+                conn.add_extra_chain_cert(chain_cert.clone())?;
             }
-            conn.cert_store_mut().add_cert(chain_cert.x509.clone())?;
+            conn.cert_store_mut().add_cert(chain_cert.clone())?;
         }
         conn.check_private_key()?;
 
@@ -366,11 +356,11 @@ pub trait SanChecker {
 
 impl SanChecker for Certs {
     fn verify_san(&self, identity: &Identity) -> Result<(), TlsError> {
-        self.cert.x509.verify_san(identity)
+        self.cert.verify_san(identity)
     }
 }
 
-pub fn extract_sans(cert: &x509::X509) -> Vec<Identity> {
+pub fn extract_sans(cert: &X509) -> Vec<Identity> {
     cert.subject_alt_names()
         .iter()
         .flat_map(|sans| sans.iter())
@@ -380,7 +370,7 @@ pub fn extract_sans(cert: &x509::X509) -> Vec<Identity> {
         .unwrap_or_default()
 }
 
-impl SanChecker for x509::X509 {
+impl SanChecker for X509 {
     fn verify_san(&self, identity: &Identity) -> Result<(), TlsError> {
         let sans = extract_sans(self);
         sans.iter()
@@ -530,11 +520,11 @@ pub fn generate_test_certs_at(
 ) -> Certs {
     let key = pkey::PKey::private_key_from_pem(TEST_PKEY).unwrap();
     let (ca_cert, ca_key) = test_ca().unwrap();
-    let mut builder = x509::X509::builder().unwrap();
-    let not_before_asn = system_time_to_asn1_time(not_before).unwrap();
+    let mut builder = X509::builder().unwrap();
+    let not_before_asn = system_time_to_asn1_time(not_before, Round::Down).unwrap();
     builder.set_not_before(&not_before_asn).unwrap();
     builder
-        .set_not_after(&system_time_to_asn1_time(not_after).unwrap())
+        .set_not_after(&system_time_to_asn1_time(not_after, Round::Up).unwrap())
         .unwrap();
 
     builder.set_pubkey(&key).unwrap();
@@ -548,7 +538,7 @@ pub fn generate_test_certs_at(
     };
     builder.set_serial_number(&serial_number).unwrap();
 
-    let mut names = boring::x509::X509NameBuilder::new().unwrap();
+    let mut names = X509NameBuilder::new().unwrap();
     names.append_entry_by_text("O", "cluster.local").unwrap();
     let names = names.build();
     builder.set_issuer_name(&names).unwrap();
@@ -587,14 +577,10 @@ pub fn generate_test_certs_at(
 
     builder.sign(&ca_key, MessageDigest::sha256()).unwrap();
 
-    let mut cert = ZtunnelCert::new(builder.build());
-    // For sub-second granularity
-    cert.not_before = not_before;
-    cert.not_after = not_after;
     Certs {
-        cert,
         key,
-        chain: vec![ZtunnelCert::new(ca_cert)],
+        cert: builder.build(),
+        chain: vec![ca_cert],
     }
 }
 
@@ -607,14 +593,14 @@ pub fn generate_test_certs(
     generate_test_certs_at(id, not_before, not_before + duration_until_expiry)
 }
 
-fn test_ca() -> Result<(x509::X509, PKey<Private>), Error> {
-    let cert = x509::X509::from_pem(TEST_ROOT)?;
+fn test_ca() -> Result<(X509, PKey<Private>), Error> {
+    let cert = X509::from_pem(TEST_ROOT)?;
     let key = pkey::PKey::private_key_from_pem(TEST_ROOT_KEY)?;
     Ok((cert, key))
 }
 
 pub fn test_certs() -> Certs {
-    let cert = ZtunnelCert::new(x509::X509::from_pem(TEST_CERT).unwrap());
+    let cert = X509::from_pem(TEST_CERT).unwrap();
     let key = pkey::PKey::private_key_from_pem(TEST_PKEY).unwrap();
     let chain = vec![cert.clone()];
     Certs { cert, key, chain }
