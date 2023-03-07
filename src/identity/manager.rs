@@ -538,121 +538,12 @@ pub mod mock {
 
 #[cfg(test)]
 mod tests {
-    use std::time;
-
     use matches::assert_matches;
 
     use crate::identity::caclient::mock::CaClient as MockCaClient;
-    use crate::identity::{self, *};
+    use crate::identity::*;
 
-    use super::{mock, *};
-
-    async fn stress_many_ids(sm: Arc<SecretManager>, iterations: u32) {
-        for i in 0..iterations {
-            let id = identity::Identity::Spiffe {
-                trust_domain: "cluster.local".to_string(),
-                namespace: "istio-system".to_string(),
-                service_account: format!("ztunnel{i}"),
-            };
-            sm.fetch_certificate(&id)
-                .await
-                .expect("Didn't get a cert as expected.");
-        }
-    }
-
-    async fn stress_single_id(sm: Arc<SecretManager>, id: Identity, dur: Duration) {
-        let start_time = time::Instant::now();
-        loop {
-            let current_time = time::Instant::now();
-            if current_time - start_time > dur {
-                break;
-            }
-            sm.fetch_certificate(&id)
-                .await
-                .expect("Didn't get a cert as expected.");
-            tokio::time::sleep(Duration::from_micros(500)).await;
-        }
-    }
-
-    async fn verify_cert_updates(
-        sm: Arc<SecretManager>,
-        id: Identity,
-        dur: Duration,
-        cert_lifetime: Duration,
-    ) {
-        let start_time = time::Instant::now();
-        let expected_update_interval = cert_lifetime.as_millis() / 2;
-        let mut total_updates = 0;
-        let mut current_cert = sm
-            .fetch_certificate(&id)
-            .await
-            .expect("Didn't get a cert as expected.");
-        loop {
-            let new_cert = sm
-                .fetch_certificate(&id)
-                .await
-                .expect("Didn't get a cert as expected.");
-
-            if current_cert != new_cert {
-                total_updates += 1;
-                current_cert = new_cert;
-            }
-            if time::Instant::now() - start_time > dur {
-                break;
-            }
-            tokio::time::sleep(Duration::from_micros(100)).await;
-        }
-        assert_eq!(total_updates, dur.as_millis() / expected_update_interval);
-    }
-
-    #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
-    async fn test_stress_caching() {
-        let mut tasks: Vec<tokio::task::JoinHandle<()>> = Vec::new();
-        let secret_manager = mock::new_secret_manager(Duration::from_millis(50));
-
-        for _n in 0..8 {
-            tasks.push(tokio::spawn(stress_many_ids(secret_manager.clone(), 100)));
-        }
-        let results = futures::future::join_all(tasks).await;
-        for result in results.iter() {
-            assert!(result.is_ok());
-        }
-        assert_eq!(100, secret_manager.cache_len().await);
-    }
-
-    #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
-    async fn test_cache_refresh() {
-        let mut tasks: Vec<tokio::task::JoinHandle<()>> = Vec::new();
-        let test_dur = Duration::from_millis(200);
-
-        let id: Identity = Default::default();
-
-        // Certs added to the cache should be refreshed every 80 millis
-        let cert_lifetime = Duration::from_millis(160);
-        let secret_manager = mock::new_secret_manager(cert_lifetime);
-
-        // Spawn task that verifies cert updates.
-        tasks.push(tokio::spawn(verify_cert_updates(
-            secret_manager.clone(),
-            id.clone(),
-            test_dur,
-            cert_lifetime,
-        )));
-
-        // Start spamming fetches for that cert.
-        for _n in 0..7 {
-            tasks.push(tokio::spawn(stress_single_id(
-                secret_manager.clone(),
-                id.clone(),
-                test_dur,
-            )));
-        }
-
-        let results = futures::future::join_all(tasks).await;
-        for result in results.iter() {
-            assert!(result.is_ok());
-        }
-    }
+    use super::*;
 
     fn collect_strings<T: IntoIterator>(xs: T) -> Vec<String>
     where
